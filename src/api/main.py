@@ -1,32 +1,31 @@
 """
-Job Scam Detector API - Production-grade FastAPI service
-Inspired by YASEN-ALPHA architecture
-Enterprise features: caching, rate limiting, webhooks, batch processing
+Job Scam Detector API - ENTERPRISE-GRADE
+Production-ready with rate limiting, monitoring, and authentication
 """
 
 import pickle
 import re
 import time
-import asyncio
 import threading
 import random
 import hashlib
-import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
-from functools import lru_cache
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Dict
 import logging
 import requests
 import uvicorn
 import os
+import secrets
 
 # ============================================================================
 # CONFIGURATION
@@ -43,7 +42,7 @@ MODEL_PATH = Path("models/production_model.pkl")
 VECTORIZER_PATH = Path("models/vectorizer.pkl")
 THRESHOLD_PATH = Path("models/threshold.txt")
 MODEL_VERSION = "2.0.0"
-MODEL_ACCURACY = 0.968  # 96.8% from your tests
+MODEL_ACCURACY = 0.968
 
 try:
     with open(MODEL_PATH, 'rb') as f:
@@ -54,112 +53,93 @@ try:
         THRESHOLD = float(f.read().strip())
     logger.info(f"✅ Model loaded: {type(model).__name__}")
     logger.info(f"✅ Threshold: {THRESHOLD}")
-    logger.info(f"✅ Model accuracy: {MODEL_ACCURACY*100:.1f}%")
 except Exception as e:
     logger.error(f"❌ Failed to load model: {e}")
     raise
 
-# Industry categories from your test data
 SUPPORTED_INDUSTRIES = [
-    "Technology", "Healthcare", "Finance", "Retail", "Education",
-    "Food Service", "Transportation", "Construction", "Remote",
-    "Marketing", "Sales", "Administrative", "Legal", "Manufacturing"
+    "Technology", "Healthcare", "Retail", "Education", "Finance",
+    "Manufacturing", "Legal", "Sales", "Food Service", "Transportation",
+    "Administrative", "Marketing", "Construction", "Design", "Customer Service",
+    "Remote"
 ]
 
 # ============================================================================
-# RATE LIMITING SYSTEM (Psychological only - headers)
+# PROMETHEUS METRICS (optional - will work without if not installed)
 # ============================================================================
 
-class RateLimiter:
-    def __init__(self):
-        self.usage = defaultdict(lambda: defaultdict(int))
-        self.per_second_usage = defaultdict(lambda: defaultdict(list))
-        self.lock = threading.Lock()
-        
-        self.tier_limits = {
-            "free": 100,      # 100 calls/month
-            "pro": 1000,      # 1,000 calls/month
-            "business": 10000, # 10,000 calls/month
-            "enterprise": 100000
-        }
-        
-        self.tier_rps = {
-            "free": 1,
-            "pro": 10,
-            "business": 50,
-            "enterprise": 200
-        }
-        
-        self._start_cleanup()
-        logger.info("✅ Rate limiter initialized")
+try:
+    from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
     
-    def _get_identifier(self, request: Request, api_key: Optional[str]) -> str:
-        client_ip = request.client.host if request.client else "unknown"
-        return f"ip_{client_ip}"
-    
-    def _get_month(self) -> str:
-        return datetime.now().strftime("%Y-%m")
-    
-    def get_headers(self, request: Request, api_key: Optional[str], tier: str) -> Dict:
-        identifier = self._get_identifier(request, api_key)
-        current_month = self._get_month()
-        
-        monthly_limit = self.tier_limits.get(tier, 100)
-        rps_limit = self.tier_rps.get(tier, 1)
-        
-        with self.lock:
-            current_monthly = self.usage[identifier][current_month]
-            remaining = max(0, monthly_limit - current_monthly)
-            
-            headers = {
-                "X-RateLimit-Limit": str(monthly_limit),
-                "X-RateLimit-Remaining": str(remaining),
-                "X-RateLimit-Reset": str(self._seconds_until_month_end()),
-                "X-RateLimit-Tier": tier,
-                "X-RateLimit-PerSecond": str(rps_limit)
-            }
-            
-            self.usage[identifier][current_month] = current_monthly + 1
-            return headers
-    
-    def _seconds_until_month_end(self) -> int:
-        now = datetime.now()
-        if now.month == 12:
-            next_month = datetime(now.year + 1, 1, 1)
-        else:
-            next_month = datetime(now.year, now.month + 1, 1)
-        return int((next_month - now).total_seconds())
-    
-    def _start_cleanup(self):
-        def cleanup():
-            while True:
-                time.sleep(3600)
-                try:
-                    current_month = self._get_month()
-                    with self.lock:
-                        to_delete = []
-                        for identifier in self.usage:
-                            for month in list(self.usage[identifier].keys()):
-                                if month < current_month:
-                                    del self.usage[identifier][month]
-                            if not self.usage[identifier]:
-                                to_delete.append(identifier)
-                        for identifier in to_delete:
-                            del self.usage[identifier]
-                except Exception as e:
-                    logger.error(f"Rate limit cleanup error: {e}")
-        
-        thread = threading.Thread(target=cleanup, daemon=True)
-        thread.start()
+    predictions_total = Counter('predictions_total', 'Total predictions', ['result'])
+    prediction_latency = Histogram('prediction_latency_seconds', 'Prediction latency')
+    api_requests = Counter('api_requests_total', 'Total API requests', ['endpoint', 'method'])
+    error_counter = Counter('api_errors_total', 'Total API errors', ['endpoint', 'error_type'])
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+    logger.warning("⚠️ Prometheus not installed. Metrics disabled.")
 
-rate_limiter = RateLimiter()
+# ============================================================================
+# RATE LIMITING (simpler version without slowapi to avoid issues)
+# ============================================================================
+
+class SimpleRateLimiter:
+    """Simple in-memory rate limiter"""
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+    
+    def check_rate_limit(self, key: str, limit: int, window: int) -> bool:
+        """Check if rate limit is exceeded"""
+        now = time.time()
+        with self.lock:
+            # Clean old requests
+            self.requests[key] = [t for t in self.requests[key] if now - t < window]
+            
+            # Check limit
+            if len(self.requests[key]) >= limit:
+                return False
+            
+            # Add current request
+            self.requests[key].append(now)
+            return True
+
+rate_limiter = SimpleRateLimiter()
+
+# ============================================================================
+# API KEY AUTHENTICATION
+# ============================================================================
+
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+# Simple API key store (replace with database in production)
+API_KEYS = {
+    "free_key_123": {"tier": "free", "calls_per_month": 100, "rate_limit": 5},  # 5 per minute
+    "pro_key_456": {"tier": "pro", "calls_per_month": 1000, "rate_limit": 50},
+    "business_key_789": {"tier": "business", "calls_per_month": 10000, "rate_limit": 200},
+}
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """Verify API key and return tier"""
+    if not api_key:
+        return {"tier": "free", "api_key": None, "rate_limit": 5}
+    
+    if api_key in API_KEYS:
+        return {"tier": API_KEYS[api_key]["tier"], "api_key": api_key, "rate_limit": API_KEYS[api_key]["rate_limit"]}
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key"
+    )
 
 # ============================================================================
 # CACHE SYSTEM
 # ============================================================================
 
 class Cache:
-    def __init__(self, ttl=300):  # 5 minutes default
+    def __init__(self, ttl=300):
         self.cache = {}
         self.ttl = ttl
         self.stats = {"hits": 0, "misses": 0}
@@ -207,14 +187,35 @@ class Cache:
         thread = threading.Thread(target=cleanup, daemon=True)
         thread.start()
 
-cache = Cache(ttl=300)  # 5 minute cache
+cache = Cache(ttl=300)
 
 # ============================================================================
-# TEXT CLEANING (MUST MATCH TRAINING)
+# CREATE FASTAPI APP
+# ============================================================================
+
+app = FastAPI(
+    title="Job Scam Detector API",
+    description="Detect job scams with 96.8% accuracy. 0% false positives on LinkedIn real jobs.",
+    version=MODEL_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Add middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# ============================================================================
+# TEXT CLEANING
 # ============================================================================
 
 def clean_text(text: str) -> str:
-    """Clean text for inference (must match training)"""
     if pd.isna(text):
         return ""
     text = str(text).lower()
@@ -230,9 +231,21 @@ def clean_text(text: str) -> str:
 # ============================================================================
 
 class JobPost(BaseModel):
-    title: str = Field(..., description="Job title", example="Senior Software Engineer")
-    description: str = Field(..., description="Job description", example="We are looking for...")
+    title: str = Field(..., description="Job title", example="Senior Software Engineer", min_length=1, max_length=500)
+    description: str = Field(..., description="Job description", example="We are looking for...", min_length=1, max_length=10000)
     company: Optional[str] = Field(default="", description="Company name", example="Google")
+    
+    @validator('title')
+    def title_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Title cannot be empty')
+        return v.strip()
+    
+    @validator('description')
+    def description_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Description cannot be empty')
+        return v.strip()
 
 class BatchJobPost(BaseModel):
     jobs: List[JobPost] = Field(..., description="List of jobs to predict", max_items=100)
@@ -244,51 +257,21 @@ class PredictionResponse(BaseModel):
     threshold: float
     model_version: str
     timestamp: str
-
-class BatchPredictionResponse(BaseModel):
-    results: List[Dict]
-    total: int
-    scams_found: int
-    timestamp: str
-
-class StatsResponse(BaseModel):
-    total_predictions: int
-    scam_rate: float
-    avg_confidence: float
-    model_accuracy: float
-    model_version: str
-    threshold: float
-    last_updated: str
+    processing_time_ms: Optional[int] = None
 
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
+    model_type: str
     threshold: float
     model_accuracy: float
+    version: str
     timestamp: str
 
 # ============================================================================
-# FASTAPI APP
+# STATISTICS TRACKING
 # ============================================================================
 
-app = FastAPI(
-    title="Job Scam Detector API",
-    description="Detect job scams with 96.8% accuracy. 0% false positives on LinkedIn real jobs. 100% scam detection on Handshake.",
-    version=MODEL_VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Statistics tracking
 stats = {
     "total_predictions": 0,
     "scam_count": 0,
@@ -297,22 +280,36 @@ stats = {
 }
 
 # ============================================================================
-# MIDDLEWARE & DEPENDENCIES
+# REQUEST LOGGING MIDDLEWARE
 # ============================================================================
 
-def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    """Verify API key - RapidAPI handles actual authentication"""
-    return {"tier": "pro" if x_api_key else "free"}
-
-async def get_rate_headers(
-    request: Request,
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
-):
-    return rate_limiter.get_headers(request, api_key, auth['tier'])
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    # Rate limiting check (simple)
+    client_ip = request.client.host if request.client else "unknown"
+    if not rate_limiter.check_rate_limit(client_ip, 60, 60):  # 60 requests per minute
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded", "code": 429, "message": "Too many requests"}
+        )
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    if process_time > 1.0:
+        logger.warning(f"Slow request: {request.method} {request.url.path} took {process_time:.2f}s")
+    
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    if PROMETHEUS_AVAILABLE:
+        api_requests.labels(endpoint=request.url.path, method=request.method).inc()
+    
+    return response
 
 # ============================================================================
-# STARTUP / SHUTDOWN
+# STARTUP EVENT
 # ============================================================================
 
 @app.on_event("startup")
@@ -326,22 +323,12 @@ async def startup_event():
     logger.info("="*60)
     
     # Warm up cache
-    logger.info("🔥 Warming up cache...")
     test_job = JobPost(title="Software Engineer", description="Build software")
     text = clean_text(test_job.title) + " " + clean_text(test_job.description)
     X = vectorizer.transform([text])
     prob = model.predict_proba(X)[0, 1]
-    is_scam = prob >= THRESHOLD
-    
-    cache.set("test_prediction", {
-        "is_scam": is_scam,
-        "probability": float(prob)
-    })
+    cache.set("test_prediction", {"is_scam": prob >= THRESHOLD, "probability": float(prob)})
     logger.info("✅ Cache warmed up")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Job Scam Detector API shutting down...")
 
 # ============================================================================
 # ENDPOINTS
@@ -349,18 +336,18 @@ async def shutdown_event():
 
 @app.get("/", response_model=HealthResponse, tags=["Root"])
 async def root():
-    """Service information and health check"""
     return {
         "status": "healthy",
         "model_loaded": True,
+        "model_type": type(model).__name__,
         "threshold": THRESHOLD,
         "model_accuracy": MODEL_ACCURACY,
+        "version": MODEL_VERSION,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Detailed health check for monitoring"""
     return {
         "status": "healthy",
         "model_loaded": True,
@@ -376,27 +363,25 @@ async def health_check():
 async def predict(
     job: JobPost,
     request: Request,
-    rate_headers: dict = Depends(get_rate_headers),
-    api_key: Optional[str] = Header(None, alias="X-API-Key")
+    api_key_info: dict = Depends(verify_api_key)
 ):
-    """Predict if a single job post is a scam"""
     start_time = time.time()
+    
+    # Check rate limit by API key
+    key_id = api_key_info.get("api_key", "free")
+    rate_limit = api_key_info.get("rate_limit", 5)
+    if not rate_limiter.check_rate_limit(key_id, rate_limit, 60):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     
     # Check cache
     cache_key = hashlib.md5(f"{job.title}{job.description}".encode()).hexdigest()
     cached = cache.get(cache_key)
     if cached:
-        logger.info(f"✅ Cache HIT: {job.title[:50]}")
-        return JSONResponse(
-            content=cached,
-            headers={
-                **rate_headers,
-                "X-Cache": "HIT",
-                "X-Response-Time": f"{int((time.time() - start_time)*1000)}ms"
-            }
-        )
+        processing_time = int((time.time() - start_time) * 1000)
+        cached["processing_time_ms"] = processing_time
+        return cached
     
-    # Clean and predict
+    # Predict
     text = clean_text(job.title) + " " + clean_text(job.description)
     X = vectorizer.transform([text])
     prob = float(model.predict_proba(X)[0, 1])
@@ -416,35 +401,32 @@ async def predict(
         stats["scam_count"] += 1
     stats["confidence_sum"] += prob
     
+    if PROMETHEUS_AVAILABLE:
+        predictions_total.labels(result="scam" if is_scam else "real").inc()
+    
+    processing_time = int((time.time() - start_time) * 1000)
+    
     response = {
         "is_scam": is_scam,
         "probability": round(prob, 4),
         "confidence": confidence,
         "threshold": THRESHOLD,
         "model_version": MODEL_VERSION,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "processing_time_ms": processing_time
     }
     
     cache.set(cache_key, response)
-    logger.info(f"Prediction: {job.title[:50]} -> {'SCAM' if is_scam else 'REAL'} ({prob:.3f})")
+    logger.info(f"Prediction: {job.title[:50]} -> {'SCAM' if is_scam else 'REAL'} ({prob:.3f}) in {processing_time}ms")
     
-    return JSONResponse(
-        content=response,
-        headers={
-            **rate_headers,
-            "X-Cache": "MISS",
-            "X-Response-Time": f"{int((time.time() - start_time)*1000)}ms"
-        }
-    )
+    return response
 
-@app.post("/predict/batch", response_model=BatchPredictionResponse, tags=["Prediction"])
+@app.post("/predict/batch", tags=["Prediction"])
 async def predict_batch(
     batch: BatchJobPost,
     request: Request,
-    rate_headers: dict = Depends(get_rate_headers),
-    api_key: Optional[str] = Header(None, alias="X-API-Key")
+    api_key_info: dict = Depends(verify_api_key)
 ):
-    """Predict multiple job posts at once (max 100)"""
     if len(batch.jobs) > 100:
         raise HTTPException(status_code=400, detail="Max 100 jobs per batch")
     
@@ -468,161 +450,55 @@ async def predict_batch(
             "confidence": "high" if prob > 0.7 else "medium" if prob > 0.3 else "low"
         })
         
-        # Update stats
         stats["total_predictions"] += 1
         if is_scam:
             stats["scam_count"] += 1
         stats["confidence_sum"] += prob
     
-    return JSONResponse(
-        content={
-            "results": results,
-            "total": len(batch.jobs),
-            "scams_found": scams_found,
-            "timestamp": datetime.now().isoformat()
-        },
-        headers=rate_headers
-    )
+    return {
+        "results": results,
+        "total": len(batch.jobs),
+        "scams_found": scams_found,
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.get("/stats", tags=["Info"])
-async def get_stats(
-    request: Request,
-    rate_headers: dict = Depends(get_rate_headers),
-    api_key: Optional[str] = Header(None, alias="X-API-Key")
-):
-    """Get model performance and usage statistics"""
+async def get_stats():
     total = stats["total_predictions"]
     scam_rate = stats["scam_count"] / total if total > 0 else 0
     avg_confidence = stats["confidence_sum"] / total if total > 0 else 0
     
-    return JSONResponse(
-        content={
-            "total_predictions": total,
-            "scam_rate": round(scam_rate, 4),
-            "avg_confidence": round(avg_confidence, 4),
-            "model_accuracy": MODEL_ACCURACY,
-            "model_version": MODEL_VERSION,
-            "threshold": THRESHOLD,
-            "last_updated": datetime.now().isoformat(),
-            "uptime_hours": (datetime.now() - stats["start_time"]).total_seconds() / 3600
-        },
-        headers=rate_headers
-    )
+    return {
+        "total_predictions": total,
+        "scam_rate": round(scam_rate, 4),
+        "avg_confidence": round(avg_confidence, 4),
+        "model_accuracy": MODEL_ACCURACY,
+        "model_version": MODEL_VERSION,
+        "threshold": THRESHOLD,
+        "last_updated": datetime.now().isoformat(),
+        "uptime_hours": (datetime.now() - stats["start_time"]).total_seconds() / 3600
+    }
 
 @app.get("/industries", tags=["Info"])
-async def get_industries(
-    request: Request,
-    rate_headers: dict = Depends(get_rate_headers)
-):
-    """Get list of supported industries with sample counts"""
-    return JSONResponse(
-        content={
-            "industries": SUPPORTED_INDUSTRIES,
-            "total": len(SUPPORTED_INDUSTRIES),
-            "message": "Model tested on real jobs across these industries",
-            "timestamp": datetime.now().isoformat()
-        },
-        headers=rate_headers
-    )
-
-@app.get("/cache-stats", tags=["Monitoring"])
-async def get_cache_stats(
-    request: Request,
-    rate_headers: dict = Depends(get_rate_headers)
-):
-    """Get cache performance statistics"""
-    return JSONResponse(
-        content=cache.get_stats(),
-        headers=rate_headers
-    )
-
-@app.get("/live-stats", tags=["Proof"])
-async def get_live_stats(
-    request: Request,
-    rate_headers: dict = Depends(get_rate_headers)
-):
-    """Live proof dashboard with real-time metrics"""
-    cache_stats = cache.get_stats()
-    total = stats["total_predictions"]
-    
-    stats_response = {
-        "status": "operational",
-        "model": {
-            "name": "Logistic Regression + TF-IDF",
-            "version": MODEL_VERSION,
-            "accuracy": f"{MODEL_ACCURACY*100:.1f}%",
-            "threshold": THRESHOLD,
-            "tested_on": "63 real jobs (LinkedIn + Handshake)",
-            "industries": len(SUPPORTED_INDUSTRIES)
-        },
-        "performance": {
-            "cache_hit_rate": cache_stats['hit_rate'],
-            "total_predictions": total,
-            "scam_rate": f"{stats['scam_count']/total*100:.1f}%" if total > 0 else "0%",
-            "avg_confidence": f"{stats['confidence_sum']/total*100:.1f}%" if total > 0 else "0%"
-        },
-        "test_results": {
-            "linkedin_real_jobs": "32/32 (100%)",
-            "handshake_real_jobs": "10/11 (91%)",
-            "scam_detection": "19/20 (95%)",
-            "overall": "61/63 (96.8%)"
-        },
-        "badges": [
-            "🏆 96.8% ACCURACY",
-            "⚡ 0% FALSE POSITIVES (LinkedIn)",
-            "📊 TESTED ON REAL JOBS",
-            "🔓 OPEN SOURCE"
-        ],
-        "pricing": {
-            "free": "100 calls/month",
-            "pro": "$49/month - 1,000 calls",
-            "business": "$199/month - 10,000 calls",
-            "enterprise": "Contact for custom pricing"
-        },
+async def get_industries():
+    return {
+        "industries": SUPPORTED_INDUSTRIES,
+        "total": len(SUPPORTED_INDUSTRIES),
+        "message": "Model tested on real jobs across these industries",
         "timestamp": datetime.now().isoformat()
     }
-    
-    return JSONResponse(content=stats_response, headers=rate_headers)
 
-@app.get("/verify", tags=["Utility"])
-async def verify_job_url(
-    url: str,
-    request: Request,
-    rate_headers: dict = Depends(get_rate_headers)
-):
-    """Extract and verify a job from a URL (placeholder for future)"""
-    # This is a placeholder - in production, you'd scrape the URL
-    return JSONResponse(
-        content={
-            "url": url,
-            "status": "pending",
-            "message": "URL scraping coming soon. Use /predict endpoint with title/description for now.",
-            "timestamp": datetime.now().isoformat()
-        },
-        headers=rate_headers
-    )
+@app.get("/metrics", tags=["Monitoring"])
+async def get_metrics():
+    if PROMETHEUS_AVAILABLE:
+        return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return {"error": "Metrics not enabled", "install": "pip install prometheus-client"}
 
-# ============================================================================
-# KEEP ALIVE SYSTEM (for Render free tier)
-# ============================================================================
-
-def keep_alive():
-    render_url = os.environ.get('RENDER_URL', 'https://job-scam-detector.onrender.com')
-    
-    while True:
-        sleep_time = 240 + (60 * random.random())
-        time.sleep(sleep_time)
-        
-        try:
-            response = requests.get(f"{render_url}/health", timeout=10)
-            if response.status_code == 200:
-                logger.info(f"💤 Keep-alive ping successful (sleep: {sleep_time:.0f}s)")
-        except Exception as e:
-            logger.error(f"Self-ping failed: {e}")
-
-keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
-keep_alive_thread.start()
-logger.info("✅ Keep-alive system started")
+@app.get("/cache-stats", tags=["Admin"])
+async def get_cache_stats(api_key_info: dict = Depends(verify_api_key)):
+    if api_key_info.get("tier") not in ["business", "enterprise"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return cache.get_stats()
 
 # ============================================================================
 # ERROR HANDLERS
@@ -632,25 +508,34 @@ logger.info("✅ Keep-alive system started")
 async def not_found_handler(request, exc):
     return JSONResponse(
         status_code=404,
-        content={
-            "error": "Endpoint not found",
-            "code": 404,
-            "docs": "/docs",
-            "timestamp": datetime.now().isoformat()
-        }
+        content={"error": "Endpoint not found", "code": 404, "docs": "/docs", "timestamp": datetime.now().isoformat()}
     )
 
 @app.exception_handler(500)
 async def internal_error_handler(request, exc):
     logger.error(f"Internal server error: {exc}")
+    if PROMETHEUS_AVAILABLE:
+        error_counter.labels(endpoint=request.url.path, error_type="500").inc()
     return JSONResponse(
         status_code=500,
-        content={
-            "error": "Internal server error",
-            "code": 500,
-            "timestamp": datetime.now().isoformat()
-        }
+        content={"error": "Internal server error", "code": 500, "timestamp": datetime.now().isoformat()}
     )
+
+# ============================================================================
+# KEEP ALIVE (for Render free tier)
+# ============================================================================
+
+def keep_alive():
+    render_url = os.environ.get('RENDER_URL', 'https://yasen-alpha-scam-detector.onrender.com')
+    while True:
+        time.sleep(300)  # 5 minutes
+        try:
+            requests.get(f"{render_url}/health", timeout=10)
+        except:
+            pass
+
+keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+keep_alive_thread.start()
 
 # ============================================================================
 # RUN
@@ -658,10 +543,4 @@ async def internal_error_handler(request, exc):
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8000))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        workers=2
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, workers=2)
