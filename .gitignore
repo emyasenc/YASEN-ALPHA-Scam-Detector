@@ -1,0 +1,40 @@
+# Virtual Environment
+venv/
+venv311/
+env/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Data files (if large)
+*.parquet
+*.csv
+!data/*.csv
+
+# Models (if large)
+*.pkl
+!models/threshold.txt
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution
+dist/
+build/
+*.egg-info/
+.DS_Store

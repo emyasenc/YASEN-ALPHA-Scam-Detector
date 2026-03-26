@@ -1,0 +1,45 @@
+# src/config/config.yaml
+project:
+  name: "Job Scam Detector"
+  version: "2.0.0"
+
+paths:
+  data_raw: "src/data/raw/"
+  data_processed: "src/data/processed/"
+  models: "models/"
+  logs: "logs/"
+  reports: "reports/"
+
+data:
+  sources:
+    remoteok: true
+    weworkremotely: true
+    indeed_rss: true
+  max_jobs_per_source: 100
+  test_split: 0.2
+  random_state: 42
+
+features:
+  vectorizer:
+    max_features: 500
+    stop_words: "english"
+    ngram_range: [1, 2]
+    min_df: 2
+    max_df: 0.8
+
+model:
+  type: "logistic_regression"
+  parameters:
+    C: 0.5
+    class_weight: "balanced"
+    max_iter: 1000
+  threshold: 0.55
+
+training:
+  test_size: 0.2
+  random_state: 42
+  cv_folds: 5
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
