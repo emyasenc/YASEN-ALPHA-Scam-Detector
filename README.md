@@ -5,7 +5,7 @@
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
 [![RapidAPI](https://img.shields.io/badge/RapidAPI-0066FF?style=flat&logo=rapidapi&logoColor=white)](https://rapidapi.com/emyasenc/api/yasen-alpha-job-scam-detector)
 
-> **Enterprise-grade job scam detection with 98.8% accuracy and 1.2% false positives — 5x better than industry average.**
+> **Enterprise-grade job scam detection using Logistic Regression model with 98.8% accuracy and 1.2% false positives — 5x better than industry average.**
 
 ## 📊 Quick Stats
 
