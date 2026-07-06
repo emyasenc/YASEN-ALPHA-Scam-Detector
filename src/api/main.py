@@ -111,28 +111,55 @@ rate_limiter = SimpleRateLimiter()
 # API KEY AUTHENTICATION
 # ============================================================================
 
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-# Simple API key store (replace with database in production)
-API_KEYS = {
-    "free_key_123": {"tier": "free", "calls_per_month": 100, "rate_limit": 5},  # 5 per minute
-    "pro_key_456": {"tier": "pro", "calls_per_month": 1000, "rate_limit": 50},
-    "business_key_789": {"tier": "business", "calls_per_month": 10000, "rate_limit": 200},
-}
+def get_api_keys():
+    """Load API keys from environment variables"""
+    keys = {}
+    
+    # Free tier
+    free_key = os.getenv("FREE_API_KEY")
+    if free_key:
+        keys[free_key] = {
+            "tier": "free", 
+            "calls_per_month": 100, 
+            "rate_limit": 5
+        }
+    
+    # Pro tier
+    pro_key = os.getenv("PRO_API_KEY")
+    if pro_key:
+        keys[pro_key] = {
+            "tier": "pro", 
+            "calls_per_month": 1000, 
+            "rate_limit": 50
+        }
+    
+    # Business tier
+    business_key = os.getenv("BUSINESS_API_KEY")
+    if business_key:
+        keys[business_key] = {
+            "tier": "business", 
+            "calls_per_month": 10000, 
+            "rate_limit": 200
+        }
+    
+    # If no keys found, provide a default free tier (for development)
+    if not keys:
+        print("⚠️ No API keys found in environment. Using development mode.")
+        keys["dev_key_123"] = {"tier": "free", "calls_per_month": 1000, "rate_limit": 100}
+    
+    return keys
 
-async def verify_api_key(api_key: str = Depends(api_key_header)):
-    """Verify API key and return tier"""
-    if not api_key:
-        return {"tier": "free", "api_key": None, "rate_limit": 5}
-    
-    if api_key in API_KEYS:
-        return {"tier": API_KEYS[api_key]["tier"], "api_key": api_key, "rate_limit": API_KEYS[api_key]["rate_limit"]}
-    
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid API key"
-    )
+# Load API keys at startup
+API_KEYS = get_api_keys()
 
 # ============================================================================
 # CACHE SYSTEM
