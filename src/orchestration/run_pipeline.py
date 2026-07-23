@@ -10,6 +10,8 @@ import yaml
 from datetime import datetime
 import logging
 import subprocess
+import pandas as pd
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -38,6 +40,66 @@ class JobScamPipeline:
         
         logger.info(f"🚀 Initializing {self.config['project']['name']} v{self.config['project']['version']}")
     
+    def _clear_cache_if_needed(self):
+        """Check if dataset size changed and clear cached features if needed"""
+        data_path = Path('src/data/processed/final_dataset_enterprise.csv')
+        cache_path = Path('models/X_train.npy')
+        
+        if not data_path.exists():
+            return
+        
+        try:
+            # Get current dataset size
+            current_rows = len(pd.read_csv(data_path))
+            logger.info(f"📊 Current dataset size: {current_rows} rows")
+            
+            # Check if cached features exist
+            if cache_path.exists():
+                try:
+                    cached_X = np.load(cache_path, allow_pickle=True)
+                    cached_rows = cached_X.shape[0]
+                    
+                    if cached_rows != current_rows:
+                        logger.warning(f"⚠️ Dataset size mismatch: cached {cached_rows} rows, current {current_rows} rows")
+                        logger.info("🗑️ Clearing cached features...")
+                        
+                        # Clear .npy files
+                        for pattern in ['*.npy']:
+                            for f in Path('models').glob(pattern):
+                                f.unlink()
+                                logger.info(f"   Removed: {f}")
+                            for f in Path('src/models').glob(pattern):
+                                f.unlink()
+                                logger.info(f"   Removed: {f}")
+                        
+                        # Clear vectorizer
+                        vectorizer_path = Path('models/vectorizer.pkl')
+                        if vectorizer_path.exists():
+                            vectorizer_path.unlink()
+                            logger.info("   Removed: models/vectorizer.pkl")
+                        
+                        vectorizer_src_path = Path('src/models/vectorizer.pkl')
+                        if vectorizer_src_path.exists():
+                            vectorizer_src_path.unlink()
+                            logger.info("   Removed: src/models/vectorizer.pkl")
+                        
+                        logger.info("✅ Cache cleared successfully")
+                    else:
+                        logger.info(f"✅ Cache matches dataset size ({cached_rows} rows)")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not read cached features: {e}")
+                    logger.info("🗑️ Clearing cache to be safe...")
+                    for f in Path('models').glob('*.npy'):
+                        f.unlink(missing_ok=True)
+                    for f in Path('src/models').glob('*.npy'):
+                        f.unlink(missing_ok=True)
+                    Path('models/vectorizer.pkl').unlink(missing_ok=True)
+                    Path('src/models/vectorizer.pkl').unlink(missing_ok=True)
+                    
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check cache: {e}")
+    
     def run(self):
         """Run full pipeline"""
         logger.info("="*60)
@@ -58,6 +120,10 @@ class JobScamPipeline:
         # Stage 2: Training Pipeline (includes feature engineering)
         if "training" not in self.skip_stages:
             logger.info("\n🤖 STAGE 2: Training Pipeline")
+            
+            # 🔧 CHECK CACHE BEFORE TRAINING
+            self._clear_cache_if_needed()
+            
             training_pipeline = TrainingPipeline(self.config)
             model, X_test, y_test = training_pipeline.run()
             results['training'] = {"model": "production_model.pkl"}

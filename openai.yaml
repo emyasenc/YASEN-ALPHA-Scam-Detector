@@ -1,0 +1,60 @@
+openapi: 3.0.0
+info:
+  title: YASEN-ALPHA Job Scam Detector
+  description: 98.8% accurate job scam detection API. 1.2% false positives. Tested on 1,400+ real jobs across 16 industries.
+  version: 2.0.0
+servers:
+  - url: https://yasen-alpha-scam-detector.onrender.com
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /predict:
+    post:
+      summary: Predict if a job is a scam
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                description:
+                  type: string
+                company:
+                  type: string
+      responses:
+        '200':
+          description: Prediction result
+  /predict/batch:
+    post:
+      summary: Predict multiple jobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jobs:
+                  type: array
+      responses:
+        '200':
+          description: Batch results
+  /stats:
+    get:
+      summary: Get usage statistics
+      responses:
+        '200':
+          description: Statistics
+  /industries:
+    get:
+      summary: Get supported industries
+      responses:
+        '200':
+          description: List of industries

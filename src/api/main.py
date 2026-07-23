@@ -7,6 +7,7 @@ import pickle
 import re
 import time
 import threading
+import sqlite3
 import random
 import hashlib
 from pathlib import Path
@@ -162,6 +163,31 @@ def get_api_keys():
 API_KEYS = get_api_keys()
 
 # ============================================================================
+# API KEY VERIFICATION - THIS WAS MISSING!
+# ============================================================================
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """
+    Verify API key and return tier information.
+    If no key is provided, treat as free tier (for development).
+    """
+    if not api_key:
+        return {"tier": "free", "api_key": None, "rate_limit": 5}
+    
+    if api_key in API_KEYS:
+        return {
+            "tier": API_KEYS[api_key]["tier"],
+            "api_key": api_key,
+            "rate_limit": API_KEYS[api_key]["rate_limit"]
+        }
+    
+    # Invalid API key
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key"
+    )
+
+# ============================================================================
 # CACHE SYSTEM
 # ============================================================================
 
@@ -217,6 +243,80 @@ class Cache:
 cache = Cache(ttl=300)
 
 # ============================================================================
+# PERSISTENT STATS WITH SQLITE
+# ============================================================================
+
+class StatsDB:
+    def __init__(self, db_path="stats.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize the database with a stats table."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                total_predictions INTEGER DEFAULT 0,
+                scam_count INTEGER DEFAULT 0,
+                confidence_sum REAL DEFAULT 0.0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Insert initial row if empty
+        cursor.execute("SELECT COUNT(*) FROM stats")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO stats (total_predictions, scam_count, confidence_sum)
+                VALUES (0, 0, 0.0)
+            """)
+        conn.commit()
+        conn.close()
+
+    def update(self, is_scam, probability):
+        """Update stats after a prediction."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE stats
+            SET total_predictions = total_predictions + 1,
+                scam_count = scam_count + ?,
+                confidence_sum = confidence_sum + ?,
+                last_updated = CURRENT_TIMESTAMP
+            WHERE id = 1
+        """, (1 if is_scam else 0, probability))
+        conn.commit()
+        conn.close()
+
+    def get_stats(self):
+        """Get current stats from the database."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT total_predictions, scam_count, confidence_sum, last_updated
+            FROM stats WHERE id = 1
+        """)
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            total, scam_count, confidence_sum, last_updated = row
+            scam_rate = scam_count / total if total > 0 else 0
+            avg_confidence = confidence_sum / total if total > 0 else 0
+            return {
+                "total_predictions": total,
+                "scam_count": scam_count,
+                "scam_rate": round(scam_rate, 4),
+                "avg_confidence": round(avg_confidence, 4),
+                "last_updated": last_updated
+            }
+        return None
+
+# Initialize stats database
+stats_db = StatsDB("stats.db")
+
+# ============================================================================
 # CREATE FASTAPI APP
 # ============================================================================
 
@@ -257,10 +357,28 @@ def clean_text(text: str) -> str:
 # PYDANTIC MODELS
 # ============================================================================
 
+# ✅ UPDATED: Added reasonable max_length constraints for security and performance
 class JobPost(BaseModel):
-    title: str = Field(..., description="Job title", example="Senior Software Engineer", min_length=1, max_length=500)
-    description: str = Field(..., description="Job description", example="We are looking for...", min_length=1, max_length=10000)
-    company: Optional[str] = Field(default="", description="Company name", example="Google")
+    title: str = Field(
+        ..., 
+        description="Job title", 
+        example="Senior Software Engineer",
+        min_length=1,
+        max_length=200  # ✅ Added: job titles are rarely longer than 200 chars
+    )
+    description: str = Field(
+        ..., 
+        description="Job description", 
+        example="We are looking for...",
+        min_length=1,
+        max_length=5000  # ✅ Added: reasonable limit for job descriptions
+    )
+    company: Optional[str] = Field(
+        default="", 
+        description="Company name", 
+        example="Google",
+        max_length=100  # ✅ Added: company names are typically short
+    )
     
     @validator('title')
     def title_not_empty(cls, v):
@@ -294,17 +412,6 @@ class HealthResponse(BaseModel):
     model_accuracy: float
     version: str
     timestamp: str
-
-# ============================================================================
-# STATISTICS TRACKING
-# ============================================================================
-
-stats = {
-    "total_predictions": 0,
-    "scam_count": 0,
-    "confidence_sum": 0.0,
-    "start_time": datetime.now()
-}
 
 # ============================================================================
 # REQUEST LOGGING MIDDLEWARE
@@ -422,11 +529,8 @@ async def predict(
     else:
         confidence = "low"
     
-    # Update stats
-    stats["total_predictions"] += 1
-    if is_scam:
-        stats["scam_count"] += 1
-    stats["confidence_sum"] += prob
+    # Update stats using SQLite
+    stats_db.update(is_scam, prob)
     
     if PROMETHEUS_AVAILABLE:
         predictions_total.labels(result="scam" if is_scam else "real").inc()
@@ -477,10 +581,8 @@ async def predict_batch(
             "confidence": "high" if prob > 0.7 else "medium" if prob > 0.3 else "low"
         })
         
-        stats["total_predictions"] += 1
-        if is_scam:
-            stats["scam_count"] += 1
-        stats["confidence_sum"] += prob
+        # Update stats using SQLite for each job
+        stats_db.update(is_scam, prob)
     
     return {
         "results": results,
@@ -491,20 +593,10 @@ async def predict_batch(
 
 @app.get("/stats", tags=["Info"])
 async def get_stats():
-    total = stats["total_predictions"]
-    scam_rate = stats["scam_count"] / total if total > 0 else 0
-    avg_confidence = stats["confidence_sum"] / total if total > 0 else 0
-    
-    return {
-        "total_predictions": total,
-        "scam_rate": round(scam_rate, 4),
-        "avg_confidence": round(avg_confidence, 4),
-        "model_accuracy": MODEL_ACCURACY,
-        "model_version": MODEL_VERSION,
-        "threshold": THRESHOLD,
-        "last_updated": datetime.now().isoformat(),
-        "uptime_hours": (datetime.now() - stats["start_time"]).total_seconds() / 3600
-    }
+    stats = stats_db.get_stats()
+    if stats:
+        return stats
+    return {"error": "No stats available"}
 
 @app.get("/industries", tags=["Info"])
 async def get_industries():
@@ -547,22 +639,6 @@ async def internal_error_handler(request, exc):
         status_code=500,
         content={"error": "Internal server error", "code": 500, "timestamp": datetime.now().isoformat()}
     )
-
-# ============================================================================
-# KEEP ALIVE (for Render free tier)
-# ============================================================================
-
-def keep_alive():
-    render_url = os.environ.get('RENDER_URL', 'https://yasen-alpha-scam-detector.onrender.com')
-    while True:
-        time.sleep(300)  # 5 minutes
-        try:
-            requests.get(f"{render_url}/health", timeout=10)
-        except:
-            pass
-
-keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
-keep_alive_thread.start()
 
 # ============================================================================
 # RUN
