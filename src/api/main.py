@@ -42,8 +42,8 @@ logging.basicConfig(
 MODEL_PATH = Path("models/production_model.pkl")
 VECTORIZER_PATH = Path("models/vectorizer.pkl")
 THRESHOLD_PATH = Path("models/threshold.txt")
-MODEL_VERSION = "2.0.0"
-MODEL_ACCURACY = 0.968
+MODEL_VERSION = "2.1.0"
+MODEL_ACCURACY = 0.9944
 
 try:
     with open(MODEL_PATH, 'rb') as f:
@@ -322,7 +322,7 @@ stats_db = StatsDB("stats.db")
 
 app = FastAPI(
     title="Job Scam Detector API",
-    description="Detect job scams with 96.8% accuracy. 0% false positives on LinkedIn real jobs.",
+    description="Detect job scams with 99.44% accuracy and 0.37% false positives. Trained on 2,678+ real job posts across 16 industries.",
     version=MODEL_VERSION,
     docs_url="/docs",
     redoc_url="/redoc"
